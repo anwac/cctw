@@ -31,6 +31,7 @@ from pathlib import Path
 POLL_INTERVAL = 2.0  # dashboard refresh + file poll cadence (seconds)
 ACTIVE_SECS = 20  # session counts as "live" if it wrote within this window
 STALL_SECS = 600  # an unrecovered error older than this means "probably stuck"
+NAME_TTL = 5.0  # how often the session-name sources are rescanned (seconds)
 SCRIPT_PATH = os.path.abspath(__file__)
 
 CLEAR = "\033[2J\033[H"
@@ -138,6 +139,72 @@ def synthetic_error_text(msg: dict) -> str:
     return str(content)[:120]
 
 
+class SessionNames:
+    """session id -> session name, as set by `claude -n <name>` or /rename.
+
+    Neither source on disk is sufficient alone, so both are consulted:
+
+    ~/.claude/sessions/<pid>.json is written by every live claude process and
+    carries the current name, but is keyed by pid (which a transcript never
+    mentions) and is removed when the process exits; the sessionId inside it
+    provides the join. ~/.claude/statusline-cache/<session-id>.json is keyed
+    the way we need, is refreshed once per turn and survives the exit, so it
+    covers finished sessions. Live wins where both know a session.
+
+    Both are Claude Code internals: a missing directory, a missing field or an
+    unparsable file just means no name, never an error.
+    """
+
+    def __init__(self):
+        self.live: dict[str, str] = {}    # from ~/.claude/sessions
+        self.cached: dict[str, str] = {}  # from ~/.claude/statusline-cache
+        self.last_scan = 0.0
+
+    @staticmethod
+    def _load(path: Path) -> dict:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return d if isinstance(d, dict) else {}
+
+    def _scan_live(self):
+        live = {}
+        try:
+            paths = sorted((Path.home() / ".claude" / "sessions").glob("*.json"))
+        except OSError:
+            paths = []
+        for p in paths:
+            d = self._load(p)
+            sid, name = d.get("sessionId"), d.get("name")
+            if isinstance(sid, str) and sid and isinstance(name, str) and name:
+                live[sid] = name
+        self.live = live
+
+    def get(self, sid) -> str:
+        """Name for a session id, or "" if nothing on disk knows one."""
+        if not isinstance(sid, str) or not sid:
+            return ""
+        now = time.time()
+        if now - self.last_scan >= NAME_TTL:
+            self.last_scan = now
+            self._scan_live()
+            # Forget misses, so a session that has only just written its first
+            # statusline payload picks up a name on a later pass.
+            self.cached = {k: v for k, v in self.cached.items() if v}
+        if sid in self.live:
+            return self.live[sid]
+        if sid not in self.cached:
+            base = Path.home() / ".claude" / "statusline-cache"
+            name = self._load(base / f"{sid}.json").get("session_name")
+            self.cached[sid] = name if isinstance(name, str) else ""
+        return self.cached[sid]
+
+
+SESSION_NAMES = SessionNames()
+
+
 class Session:
     """Token state for one logical session (main thread or one sidechain)."""
 
@@ -146,6 +213,7 @@ class Session:
         self.is_sidechain = False
         self.agent_label = None
         self.agent_id = None
+        self.session_id = None       # id the name lookup joins on
         self.model = "?"
         self.context_tokens = 0      # from the most recent assistant usage
         self.output_total = 0        # cumulative output tokens
@@ -170,6 +238,12 @@ class Session:
         aid = entry.get("agentId")
         if self.agent_id is None and isinstance(aid, str) and aid:
             self.agent_id = aid
+        # Subagent lines carry the parent's sessionId, so a sidechain row shows
+        # the name of the session it is running under. That is the intent: the
+        # name identifies the claude process, not the individual agent.
+        sid = entry.get("sessionId")
+        if self.session_id is None and isinstance(sid, str) and sid:
+            self.session_id = sid
         # Directory the session is working in; last one seen wins so a session
         # that changes directory shows its latest.
         cwd = entry.get("cwd")
@@ -273,6 +347,15 @@ def shorten_error(text, limit: int = 40) -> str:
     return txt[:limit]
 
 
+def fmt_model(model) -> str:
+    """Display form of a model id: strip the leading "claude-", which every
+    value carries and so tells the reader nothing. "claude-fable-5" ->
+    "fable-5". Nothing else is removed."""
+    txt = model if isinstance(model, str) else str(model)
+    prefix = "claude-"
+    return txt[len(prefix):] if txt.startswith(prefix) else txt
+
+
 def pct_color(pct: float) -> str:
     if pct >= 45:
         return RED
@@ -325,7 +408,8 @@ def render(sessions, window, target, max_age):
     out.append(f"{DIM}! = recent error   || = probably stuck "
                f"(no recovery in 10m){RESET}")
     out.append("")
-    hdr = f"{'':2} {'ROLE':<18} {'MODEL':<24} {'CONTEXT':>9} {'% WIN':>6} {'OUT':>8} {'TURNS':>5} {'LAST':>6}  DIR"
+    hdr = (f"{'':2} {'ROLE':<18} {'MODEL':<8} {'CONTEXT':>9} {'% WIN':>6} "
+           f"{'OUT':>8} {'TURNS':>5} {'LAST':>6}  {'NAME':<13} DIR")
     out.append(BOLD + hdr + RESET)
     # Printable width of the five middle columns (MODEL, CONTEXT, % WIN, OUT,
     # TURNS) plus their four inner separator spaces, exactly as written in the
@@ -333,7 +417,7 @@ def render(sessions, window, target, max_age):
     # has nothing to put in those columns, so its error text fills this span
     # instead and LAST/DIR stay aligned with every other row. Keep this sum in
     # step with the field widths in the f-strings below.
-    mid_w = 24 + 1 + 9 + 1 + 6 + 1 + 8 + 1 + 5   # == 56
+    mid_w = 8 + 1 + 9 + 1 + 6 + 1 + 8 + 1 + 5   # == 40
     stuck_prefix = "stuck: "
     for s, age in visible:
         stuck = bool(s.error) and (now - s.error_ts) >= STALL_SECS
@@ -353,6 +437,8 @@ def render(sessions, window, target, max_age):
             when, wcol = f"{age/86400:.2f}d", GRAY
         role = s.label()[:18]
         rolec = CYAN if role != "main" else ""
+        name = SESSION_NAMES.get(s.session_id)[:13]
+        model = fmt_model(s.model)[:8]
         err_txt = ""
         mid = None
         if s.error:
@@ -372,13 +458,13 @@ def render(sessions, window, target, max_age):
                 err_txt = (f"  {DIM}{stuck_prefix}{short}{RESET}" if stuck
                            else f"  {RED}{short}{RESET}")
         if mid is None:
-            mid = (f"{s.model:<24} {fmt_k(s.context_tokens):>9} "
+            mid = (f"{model:<8} {fmt_k(s.context_tokens):>9} "
                    f"{col}{pct:>5.1f}%{RESET} "
                    f"{fmt_k(s.output_total):>8} {s.turns:>5}")
         out.append(
             f"{livec}{live:<2}{RESET} {rolec}{role:<18}{RESET} {mid} "
             f"{wcol}{when:>6}{RESET}"
-            f"  {DIM}{fmt_dir(s.cwd)}{RESET}{err_txt}"
+            f"  {CYAN}{name:<13}{RESET} {DIM}{fmt_dir(s.cwd)}{RESET}{err_txt}"
         )
     sys.stdout.write("\033[K\n".join(out) + "\033[K\033[J")
     sys.stdout.flush()
@@ -386,11 +472,12 @@ def render(sessions, window, target, max_age):
 
 def log_event(sess: Session, window: int):
     pct = 100.0 * sess.context_tokens / window if window else 0.0
+    name = SESSION_NAMES.get(sess.session_id)
     print(f"{time.strftime('%H:%M:%S')} {sess.label():<16} "
           f"ctx={fmt_k(sess.context_tokens)} ({pct:.1f}%) "
           f"out={fmt_k(sess.output_total)} turns={sess.turns} "
-          f"model={sess.model} file={sess.path.name}"
-          f"  {DIM}{fmt_dir(sess.cwd)}{RESET}")
+          f"model={fmt_model(sess.model)} file={sess.path.name}"
+          f"  {DIM}{name + ' ' if name else ''}{fmt_dir(sess.cwd)}{RESET}")
 
 
 def log_error(sess: Session):
