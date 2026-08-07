@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -370,6 +371,18 @@ def fmt_hours(secs: float) -> str:
     return txt[:-2] if txt.endswith(".0") else txt
 
 
+def caffeinate_running() -> bool:
+    """True while a macOS caffeinate process is alive. Anything that stops
+    pgrep from running at all (missing binary, no fork) reads as "not
+    running" rather than killing the dashboard."""
+    try:
+        return subprocess.run(["pgrep", "-x", "caffeinate"],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        return False
+
+
 def render(sessions, window, target, max_age):
     now = time.time()
     rows = sorted(sessions.values(), key=lambda s: s.last_ts, reverse=True)
@@ -403,8 +416,11 @@ def render(sessions, window, target, max_age):
     note_txt = f"  {DIM}{'; '.join(notes)}{RESET}" if notes else ""
     out = [HOME + f"{BOLD}{TITLE}{RESET}  "
                   f"{DIM}{target}{RESET}{note_txt}"]
-    out.append(f"{DIM}window={fmt_k(window)}  smart-zone %% is of {fmt_k(window)}; "
-               f"red>=45%%, yellow>=30%%; {age_note}{RESET}")
+    # Emoji sits outside the dim escape so it renders at full intensity.
+    coffee = "☕ " if caffeinate_running() else ""
+    out.append(coffee
+               + f"{DIM}window={fmt_k(window)}  smart-zone %% is of {fmt_k(window)}; "
+                 f"red>=45%%, yellow>=30%%; {age_note}{RESET}")
     out.append(f"{DIM}! = recent error   || = probably stuck "
                f"(no recovery in 10m){RESET}")
     out.append("")
