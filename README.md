@@ -23,6 +23,7 @@ python3 cctw.py --window 200000  # context window size for the % column
 python3 cctw.py --max-age 4      # hide sessions idle longer than 4 hours
 python3 cctw.py --log            # one event line per assistant turn, no dashboard
 python3 cctw.py --inspect        # dump one parsed transcript entry and exit
+python3 cctw.py --dumphistory    # write all sessions to cctw.dump.YYMMDD.HOSTNAME.txt and exit
 ```
 
 Note: the transcript format is internal to Claude Code and changes between
