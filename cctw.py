@@ -12,6 +12,7 @@ Usage:
   cctw.py --window 200000  # context window size for % display
   cctw.py --log            # event stream instead of dashboard
   cctw.py --inspect        # dump one parsed assistant entry and exit
+  cctw.py --dumphistory    # write every session to a text file and exit
 
 The transcript format is internal to Claude Code and changes between
 releases. This script parses defensively: unknown fields are ignored,
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -517,6 +519,90 @@ def inspect_one(target: Path):
     print("no assistant entry with usage found")
 
 
+def dump_history(target: Path, window: int, max_age: float):
+    """Write the state of every session to a text file, then return.
+
+    A one-shot version of the dashboard: same scan, same filters, same derived
+    columns, but nothing is clipped to the terminal height, no color escapes are
+    emitted and DIR carries the full path, so the result stays greppable. Column
+    widths follow the data instead of truncating it.
+    """
+    now = time.time()
+    cutoff = max_age * 3600          # hours in, seconds out, as in main()
+    cursors: dict[Path, FileCursor] = {}
+    sessions: dict[str, Session] = {}
+    for path in jsonl_files(target):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if cutoff > 0 and now - mtime > cutoff:
+            continue                 # too old to ever display; don't read it
+        cur = cursors[path] = FileCursor(path)
+        for entry in read_new_lines(cur):
+            key = entry_key(path, entry)
+            sess = sessions.get(key)
+            if sess is None:
+                sess = sessions[key] = Session(path)
+            sess.feed(entry, mtime)
+
+    hdr = ("ROLE", "MODEL", "CONTEXT", "%WIN", "OUT", "TURNS", "LAST", "NAME",
+           "DIR", "ERROR")
+    align = "<<>>>>><<<"             # one alignment char per column above
+    rows = []
+    hidden = 0
+    for s in sorted(sessions.values(), key=lambda s: s.last_ts, reverse=True):
+        # A session that died before its first real turn still has to be seen.
+        if s.turns == 0 and not s.error:
+            continue
+        age = now - s.last_ts
+        if cutoff > 0 and age > cutoff:
+            hidden += 1
+            continue
+        pct = 100.0 * s.context_tokens / window if window else 0.0
+        if age < 120:
+            when = f"{int(age)}s"
+        elif age < 3600:
+            when = f"{int(age/60)}m"
+        elif age < 86400:
+            when = f"{age/3600:.1f}h"
+        else:
+            when = f"{age/86400:.2f}d"
+        err = ""
+        if s.error:
+            stuck = (now - s.error_ts) >= STALL_SECS
+            err = ("stuck: " if stuck else "") + shorten_error(s.error, 200)
+        rows.append((s.label(), fmt_model(s.model), fmt_k(s.context_tokens),
+                     f"{pct:.1f}%", fmt_k(s.output_total), str(s.turns), when,
+                     SESSION_NAMES.get(s.session_id), s.cwd or "", err))
+
+    widths = [max([len(h)] + [len(r[i]) for r in rows])
+              for i, h in enumerate(hdr)]
+
+    def line(cells):
+        return "  ".join(f"{c:{a}{w}}"
+                         for c, a, w in zip(cells, align, widths)).rstrip()
+
+    out = [f"cctw session history dump  {time.strftime('%Y-%m-%d %H:%M:%S')}",
+           f"target:   {target}",
+           f"window:   {window} ({fmt_k(window)})",
+           f"sessions: {len(rows)}",
+           "",
+           line(hdr)]
+    out.extend(line(r) for r in rows)
+    if hidden:
+        out.append("")
+        out.append(f"{hidden} older hidden (>{fmt_hours(cutoff)}h; "
+                   f"--max-age 0 shows all)")
+
+    fname = (f"cctw.dump.{time.strftime('%y%m%d')}."
+             f"{socket.gethostname().split('.')[0]}.txt")
+    out_path = Path.cwd() / fname
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    print(f"wrote {out_path} ({len(rows)} sessions)")
+
+
 def maybe_respawn(start_mtime: float, respawn_argv: list[str]):
     """Re-exec this script in place if its source file changed on disk."""
     try:
@@ -552,6 +638,9 @@ def main():
                     help="print an event line per assistant turn instead of a dashboard")
     ap.add_argument("--inspect", action="store_true",
                     help="dump the latest parsed assistant entry and exit")
+    ap.add_argument("--dumphistory", action="store_true",
+                    help="write full session history to "
+                         "cctw.dump.YYMMDD.HOSTNAME.txt and exit")
     args = ap.parse_args()
 
     target = resolve_target(args.path) if args.path else default_project_dir()
@@ -563,6 +652,10 @@ def main():
 
     if args.inspect:
         inspect_one(target)
+        return
+
+    if args.dumphistory:
+        dump_history(target, args.window, args.max_age)
         return
 
     cursors: dict[Path, FileCursor] = {}
